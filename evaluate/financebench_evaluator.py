@@ -9,6 +9,7 @@ NOTE: This evaluator ALWAYS loads full PDF documents from the pdf_dir.
 Pre-extracted snippets or evidence from the benchmark JSON are ignored.
 """
 
+import argparse
 import os
 import sys
 import json
@@ -25,6 +26,8 @@ import fitz  # PyMuPDF for PDF text extraction
 
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+import importlib.util
 
 from minions.clients.ollama import OllamaClient
 from minions.clients.openai import OpenAIClient
@@ -48,6 +51,46 @@ logger = logging.getLogger(__name__)
 # GPT-4o pricing (January 2025 rates from paper)
 GPT4O_INPUT_PRICE_PER_MILLION = 2.50
 GPT4O_OUTPUT_PRICE_PER_MILLION = 10.00
+
+
+def load_logit_processor(path: str) -> Optional[Any]:
+    """
+    Dynamically load a logit processor from a Python file.
+    
+    Args:
+        path: Path to the logit processor Python file
+        
+    Returns:
+        The processor class (e.g., LearnedBloatAxisProcessor), or None if loading fails
+    """
+    if not path:
+        return None
+    
+    path = Path(path)
+    if not path.exists():
+        logger.warning(f"Logit processor file not found: {path}")
+        return None
+    
+    try:
+        spec = importlib.util.spec_from_file_location("learned_logit_processor", path)
+        if spec is None or spec.loader is None:
+            logger.warning(f"Failed to load spec for logit processor: {path}")
+            return None
+        
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        
+        # Look for the processor class
+        if hasattr(module, 'LearnedBloatAxisProcessor'):
+            logger.info(f"Loaded logit processor from {path}")
+            return module.LearnedBloatAxisProcessor
+        else:
+            logger.warning(f"No LearnedBloatAxisProcessor class found in {path}")
+            return None
+            
+    except Exception as e:
+        logger.warning(f"Failed to load logit processor from {path}: {e}")
+        return None
 
 
 def load_pdf_text(pdf_path: str) -> str:
@@ -118,17 +161,132 @@ def generate_cache_dir_name(
     return "_".join(parts)
 
 
-def generate_hash_cache_dir_name(config_path: str) -> str:
+def compute_config_hash(config_path: str) -> str:
     """
-    Generate cache directory name from hash of config file content.
+    Compute hash of config file content, excluding sample-selection
+    and runtime option fields.
     
     Returns:
-        Directory name in format: run_<hash> (e.g., run_a1b2c3d4e5f6)
+        12-character hash string
     """
     import hashlib
-    with open(config_path, 'rb') as f:
-        content_hash = hashlib.sha256(f.read()).hexdigest()[:12]
-    return f"run_{content_hash}"
+    import re
+    
+    # Fields excluded from the hash so runs with different sample selections
+    # or runtime options share the same cache
+    EXCLUDED_PATTERNS = [
+        # Sample selection fields
+        r'^CONFIG_MAX_SAMPLES=',
+        r'^CONFIG_USE_SAMPLE_INDICES=',
+        r'^CONFIG_SAMPLE_INDICES=',
+        r'^CONFIG_USE_SAMPLE_RANGE=',
+        r'^CONFIG_SAMPLE_RANGE=',
+        r'^CONFIG_FILTER_NUMERICAL=',
+        # Runtime options
+        r'^CONFIG_SKIP_ACCURACY=',
+        r'^CONFIG_USE_CACHE=',
+    ]
+    
+    with open(config_path, 'r') as f:
+        lines = f.readlines()
+    
+    # Filter out excluded lines
+    filtered_lines = []
+    for line in lines:
+        skip = False
+        for pattern in EXCLUDED_PATTERNS:
+            if re.match(pattern, line):
+                skip = True
+                break
+        if not skip:
+            filtered_lines.append(line)
+    
+    content = ''.join(filtered_lines)
+    return hashlib.sha256(content.encode()).hexdigest()[:12]
+
+
+def find_cache_dir_by_hash(output_dir: Path, config_hash: str) -> Optional[Path]:
+    """
+    Find an existing cache directory that matches the given config hash.
+    
+    Searches all subdirectories of output_dir for a config_hash.txt file
+    containing the matching hash.
+    
+    Returns:
+        Path to matching directory, or None if not found
+    """
+    if not output_dir.exists():
+        return None
+    
+    for subdir in output_dir.iterdir():
+        if not subdir.is_dir():
+            continue
+        
+        hash_file = subdir / "config_hash.txt"
+        if hash_file.exists():
+            try:
+                stored_hash = hash_file.read_text().strip()
+                if stored_hash == config_hash:
+                    return subdir
+            except Exception:
+                continue
+    
+    return None
+
+
+def create_cache_dir(output_dir: Path, config_hash: str) -> Path:
+    """
+    Create a new cache directory and store the config hash.
+    
+    Uses incrementing run numbers (run_001, run_002, etc.) for naming.
+    
+    Returns:
+        Path to the new directory
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Find the next available run number
+    existing_nums = []
+    for subdir in output_dir.iterdir():
+        if subdir.is_dir() and subdir.name.startswith("run_"):
+            try:
+                # Try to parse as run_NNN format
+                num_str = subdir.name[4:]
+                if num_str.isdigit():
+                    existing_nums.append(int(num_str))
+            except (ValueError, IndexError):
+                continue
+    
+    next_num = max(existing_nums, default=0) + 1
+    new_dir = output_dir / f"run_{next_num:03d}"
+    new_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Store the config hash
+    hash_file = new_dir / "config_hash.txt"
+    hash_file.write_text(config_hash)
+    
+    return new_dir
+
+
+def get_or_create_cache_dir(output_dir: Path, config_path: str) -> Path:
+    """
+    Get existing cache directory for config, or create a new one.
+    
+    Returns:
+        Path to the cache directory
+    """
+    config_hash = compute_config_hash(config_path)
+    
+    # Try to find existing directory with matching hash
+    existing_dir = find_cache_dir_by_hash(output_dir, config_hash)
+    if existing_dir is not None:
+        logger.info(f"Found existing cache directory: {existing_dir}")
+        return existing_dir
+    
+    # Create new directory
+    new_dir = create_cache_dir(output_dir, config_hash)
+    logger.info(f"Created new cache directory: {new_dir}")
+    return new_dir
 
 
 @dataclass
@@ -649,7 +807,28 @@ Respond with only one word: "equal" or "unequal"."""
 class ProtocolRunner:
     """Runs different protocols for evaluation."""
     
-    def __init__(self, local_model: str, remote_model: str, local_temp: float = 0.2, remote_temp: float = 0.0, num_ctx: int = 4096, local_backend: str = "ollama", sglang_base_url: str = "http://localhost:8000/v1"):
+    def __init__(
+        self,
+        local_model: str,
+        remote_model: str,
+        local_temp: float = 0.2,
+        remote_temp: float = 0.0,
+        num_ctx: int = 4096,
+        local_backend: str = "ollama",
+        sglang_base_url: str = "http://localhost:8000/v1",
+        logit_processor: Optional[Any] = None,
+        # WFSA parameters
+        generation_strategy: str = "sequential",
+        beta_explanation: float = 1.0,
+        beta_citation: float = 2.0,
+        beta_answer: float = 1.5,
+        min_tokens_explanation: int = 10,
+        min_tokens_citation: int = 5,
+        min_tokens_answer: int = 3,
+        max_tokens_explanation: int = 200,
+        max_tokens_citation: int = 150,
+        max_tokens_answer: int = 100,
+    ):
         """Initialize protocol runner with model configurations."""
         self.local_model = local_model
         self.remote_model = remote_model
@@ -658,6 +837,18 @@ class ProtocolRunner:
         self.num_ctx = num_ctx
         self.local_backend = local_backend
         self.sglang_base_url = sglang_base_url
+        self.logit_processor = logit_processor  # For constraint decoding (optional)
+        # WFSA parameters
+        self.generation_strategy = generation_strategy
+        self.beta_explanation = beta_explanation
+        self.beta_citation = beta_citation
+        self.beta_answer = beta_answer
+        self.min_tokens_explanation = min_tokens_explanation
+        self.min_tokens_citation = min_tokens_citation
+        self.min_tokens_answer = min_tokens_answer
+        self.max_tokens_explanation = max_tokens_explanation
+        self.max_tokens_citation = max_tokens_citation
+        self.max_tokens_answer = max_tokens_answer
         
         self._local_client = None
         self._remote_client = None
@@ -672,6 +863,16 @@ class ProtocolRunner:
                     model_name=self.local_model,
                     base_url=self.sglang_base_url,
                     temperature=self.local_temp,
+                    generation_strategy=self.generation_strategy,
+                    beta_explanation=self.beta_explanation,
+                    beta_citation=self.beta_citation,
+                    beta_answer=self.beta_answer,
+                    min_tokens_explanation=self.min_tokens_explanation,
+                    min_tokens_citation=self.min_tokens_citation,
+                    min_tokens_answer=self.min_tokens_answer,
+                    max_tokens_explanation=self.max_tokens_explanation,
+                    max_tokens_citation=self.max_tokens_citation,
+                    max_tokens_answer=self.max_tokens_answer,
                 )
             else:
                 self._local_client = OllamaClient(
@@ -842,7 +1043,29 @@ class ProtocolRunner:
                 base_url=self.sglang_base_url,
                 temperature=self.local_temp,
                 structured_output_schema=StructuredLocalOutput,
+                generation_strategy=self.generation_strategy,
+                beta_explanation=self.beta_explanation,
+                beta_citation=self.beta_citation,
+                beta_answer=self.beta_answer,
+                min_tokens_explanation=self.min_tokens_explanation,
+                min_tokens_citation=self.min_tokens_citation,
+                min_tokens_answer=self.min_tokens_answer,
+                max_tokens_explanation=self.max_tokens_explanation,
+                max_tokens_citation=self.max_tokens_citation,
+                max_tokens_answer=self.max_tokens_answer,
             )
+            # Use learned logit processor token IDs if processor is available
+            if self.logit_processor is not None:
+                local_client.intro_token_ids = self.logit_processor.EARLY_PHASE_TOKEN_IDS
+                local_client.always_token_ids = self.logit_processor.ALWAYS_TOKEN_IDS
+                local_client.list_token_ids = self.logit_processor.AFTER_NEWLINE_TOKEN_IDS
+            # Override token IDs if custom logit processor params provided via kwargs
+            if kwargs.get('intro_token_ids'):
+                local_client.intro_token_ids = set(kwargs['intro_token_ids'])
+            if kwargs.get('always_token_ids'):
+                local_client.always_token_ids = set(kwargs['always_token_ids'])
+            if kwargs.get('list_token_ids'):
+                local_client.list_token_ids = set(kwargs['list_token_ids'])
         else:
             local_client = OllamaClient(
                 model_name=self.local_model,
@@ -895,6 +1118,29 @@ class ProtocolRunner:
             }
 
 
+def _escape_latex(text: str) -> str:
+    """Escape special LaTeX characters in text."""
+    if text is None:
+        return "N/A"
+    text = str(text)
+    # Order matters: backslash must be first
+    replacements = [
+        ('\\', r'\textbackslash{}'),
+        ('_', r'\_'),
+        ('&', r'\&'),
+        ('%', r'\%'),
+        ('#', r'\#'),
+        ('$', r'\$'),
+        ('{', r'\{'),
+        ('}', r'\}'),
+        ('~', r'\textasciitilde{}'),
+        ('^', r'\textasciicircum{}'),
+    ]
+    for old, new in replacements:
+        text = text.replace(old, new)
+    return text
+
+
 class Evaluator:
     """Main evaluation orchestrator."""
     
@@ -909,8 +1155,7 @@ class Evaluator:
         skip_accuracy: bool = False,
         command_line: Optional[str] = None,
         use_cache: bool = True,
-        cache_dir_name: Optional[str] = None,
-        git_auto_commit: bool = True,
+        cache_dir: Optional[Path] = None,
         all_args: Optional[Dict[str, Any]] = None
     ):
         """Initialize evaluator."""
@@ -923,11 +1168,10 @@ class Evaluator:
         self.skip_accuracy = skip_accuracy
         self.command_line = command_line
         self.use_cache = use_cache
-        self.git_auto_commit = git_auto_commit
         self.all_args = all_args or {}
         
-        if cache_dir_name and use_cache:
-            self.run_output_dir = self.output_dir / cache_dir_name
+        if cache_dir and use_cache:
+            self.run_output_dir = cache_dir
             self.run_output_dir.mkdir(parents=True, exist_ok=True)
             logger.info(f"Using cache directory: {self.run_output_dir}")
         else:
@@ -955,7 +1199,6 @@ class Evaluator:
                 "protocols": self.protocols,
                 "skip_accuracy": self.skip_accuracy,
                 "use_cache": self.use_cache,
-                "git_auto_commit": self.git_auto_commit,
                 "minions_kwargs": self.minions_kwargs,
                 "all_args": self.all_args,
                 "created_at": datetime.now().isoformat()
@@ -966,6 +1209,203 @@ class Evaluator:
         if not command_path.exists() and self.command_line:
             with open(command_path, 'w', encoding='utf-8') as f:
                 f.write(self.command_line + "\n")
+        
+        # Generate LaTeX config documentation
+        self._save_config_latex()
+    
+    def _save_config_latex(self):
+        """Generate LaTeX file for config documentation.
+        
+        This is regenerated each time to include all evaluated queries.
+        """
+        tex_path = self.run_output_dir / "config.tex"
+        
+        # Extract config sections
+        all_args = self.all_args
+        global_cfg = all_args.get('global', {})
+        dataset_cfg = all_args.get('dataset', {})
+        models_cfg = all_args.get('models', {})
+        local_model = models_cfg.get('local', {})
+        remote_model = models_cfg.get('remote', {})
+        protocols_cfg = all_args.get('protocols', {})
+        minions_cfg = protocols_cfg.get('minions', {})
+        common_cfg = protocols_cfg.get('common', {})
+        
+        # Build LaTeX content
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        lines = [
+            r'\documentclass[11pt]{article}',
+            r'\usepackage[margin=1in]{geometry}',
+            r'\usepackage{booktabs}',
+            r'\usepackage{longtable}',
+            r'\usepackage{hyperref}',
+            r'\usepackage{xcolor}',
+            r'',
+            r'\hypersetup{colorlinks=true, linkcolor=blue, urlcolor=blue}',
+            r'',
+            r'\title{FinanceBench Evaluation Configuration}',
+            f'\\date{{{_escape_latex(timestamp)}}}',
+            r'',
+            r'\begin{document}',
+            r'\maketitle',
+            r'',
+            r'\section{Dataset Configuration}',
+            r'\begin{description}',
+            f'  \\item[Dataset Path] \\texttt{{{_escape_latex(dataset_cfg.get("path", "N/A"))}}}',
+            f'  \\item[PDF Directory] \\texttt{{{_escape_latex(dataset_cfg.get("pdf_dir", "N/A"))}}}',
+            r'\end{description}',
+        ]
+        
+        # Add evaluated queries under Dataset Configuration
+        lines.extend(self._get_evaluated_queries_latex())
+        
+        lines.extend([
+            r'',
+            r'\section{Model Configuration}',
+            r'',
+            r'\subsection{Local Model}',
+            r'\begin{description}',
+            f'  \\item[Model Name] \\texttt{{{_escape_latex(local_model.get("name", "N/A"))}}}',
+            f'  \\item[Backend] {_escape_latex(local_model.get("backend", "ollama"))}',
+            f'  \\item[Temperature] {local_model.get("temperature", 0.2)}',
+            f'  \\item[Context Window] {local_model.get("num_ctx", 4096)}',
+        ])
+        
+        # Add SGLang-specific settings if using sglang backend
+        if local_model.get('backend') == 'sglang':
+            lines.extend([
+                f'  \\item[SGLang URL] \\texttt{{{_escape_latex(local_model.get("sglang_base_url", "N/A"))}}}',
+                f'  \\item[Logit Processor] \\texttt{{{_escape_latex(str(local_model.get("logit_processor_path", "None")))}}}',
+                f'  \\item[Generation Strategy] {_escape_latex(local_model.get("generation_strategy", "sequential"))}',
+            ])
+        
+        lines.extend([
+            r'\end{description}',
+            r'',
+            r'\subsection{Remote Model}',
+            r'\begin{description}',
+            f'  \\item[Model Name] \\texttt{{{_escape_latex(remote_model.get("name", "N/A"))}}}',
+            f'  \\item[Temperature] {remote_model.get("temperature", 0.0)}',
+            r'\end{description}',
+            r'',
+            r'\section{Protocol Configuration}',
+            r'\begin{description}',
+            f'  \\item[Active Protocols] {_escape_latex(", ".join(protocols_cfg.get("active", [])))}',
+            f'  \\item[\\textcolor{{red}}{{Max Rounds}}] {common_cfg.get("max_rounds", 2)}',
+            f'  \\item[Samples per Task] {common_cfg.get("num_samples_per_task", 1)}',
+            r'\end{description}',
+            r'',
+        ])
+        
+        # Add MINIONS-specific settings if minions is active
+        if 'minions' in protocols_cfg.get('active', []):
+            lines.extend([
+                r'\subsection{MINIONS Settings}',
+                r'\begin{description}',
+                f'  \\item[Tasks per Round] {minions_cfg.get("num_tasks_per_round", 3)}',
+                f'  \\item[\\textcolor{{red}}{{Chunk Function}}] \\texttt{{{_escape_latex(minions_cfg.get("chunk_fn", "chunk_by_section"))}}}',
+                f'  \\item[\\textcolor{{red}}{{Max Chunk Size}}] {minions_cfg.get("max_chunk_size", 3000)} characters',
+                f'  \\item[\\textcolor{{red}}{{Pages per Chunk}}] {minions_cfg.get("pages_per_chunk", 5)}',
+            ])
+            if minions_cfg.get('use_retrieval'):
+                lines.append(f'  \\item[Retrieval] {_escape_latex(minions_cfg.get("use_retrieval", "none"))}')
+            lines.extend([
+                r'\end{description}',
+                r'',
+            ])
+        
+        lines.extend([
+            r'\end{document}',
+        ])
+        
+        # Write LaTeX file
+        try:
+            with open(tex_path, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(lines))
+            logger.info(f"Generated LaTeX config file: {tex_path}")
+            
+            # Compile LaTeX to PDF
+            self._compile_latex(tex_path)
+        except Exception as e:
+            logger.warning(f"Failed to generate LaTeX config file: {e}")
+    
+    def _compile_latex(self, tex_path: Path):
+        """Compile LaTeX file to PDF using pdflatex."""
+        try:
+            # Run pdflatex twice to resolve references
+            for _ in range(2):
+                result = subprocess.run(
+                    ['pdflatex', '-interaction=nonstopmode', '-halt-on-error', tex_path.name],
+                    cwd=str(tex_path.parent),
+                    capture_output=True,
+                    timeout=60
+                )
+            
+            pdf_path = tex_path.with_suffix('.pdf')
+            if pdf_path.exists():
+                logger.info(f"Compiled LaTeX to PDF: {pdf_path}")
+                
+                # Clean up auxiliary files
+                for ext in ['.aux', '.log', '.out']:
+                    aux_file = tex_path.with_suffix(ext)
+                    if aux_file.exists():
+                        aux_file.unlink()
+            else:
+                logger.warning(f"pdflatex did not produce PDF output")
+                
+        except FileNotFoundError:
+            logger.warning("pdflatex not found - skipping PDF compilation. Install texlive to enable.")
+        except subprocess.TimeoutExpired:
+            logger.warning("pdflatex compilation timed out")
+        except Exception as e:
+            logger.warning(f"Failed to compile LaTeX to PDF: {e}")
+    
+    def _get_evaluated_queries_latex(self) -> List[str]:
+        """Get LaTeX content listing all evaluated queries from sample_logs."""
+        lines = [
+            r'',
+            r'\subsection*{Evaluated Queries}',
+        ]
+        
+        if not self.sample_logs_dir.exists():
+            lines.append(r'\textit{(No queries evaluated yet)}')
+            return lines
+        
+        # Find all cached result JSON files
+        cache_files = sorted(self.sample_logs_dir.glob("*.json"))
+        
+        if not cache_files:
+            lines.append(r'\textit{(No queries evaluated yet)}')
+            return lines
+        
+        lines.append(r'\begin{enumerate}')
+        
+        for cache_file in cache_files:
+            try:
+                with open(cache_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                
+                question = data.get('question', 'Unknown question')
+                protocol = data.get('protocol', 'unknown')
+                sample_id = data.get('sample_id', 'unknown')
+                
+                # Truncate long questions for display
+                display_question = question[:150] + '...' if len(question) > 150 else question
+                
+                lines.append(
+                    f'  \\item \\textbf{{{_escape_latex(protocol)}}}: {_escape_latex(display_question)}'
+                )
+            except Exception:
+                # Skip files that can't be parsed
+                continue
+        
+        lines.extend([
+            r'\end{enumerate}',
+            r'',
+        ])
+        
+        return lines
     
     def _get_sample_cache_path(self, sample_id: str, protocol: str) -> Path:
         """Get the cache file path for a sample."""
@@ -1037,46 +1477,6 @@ class Evaluator:
             if log_content:
                 f.write("\n\n--- Additional Log ---\n")
                 f.write(log_content)
-        
-        if self.git_auto_commit:
-            self._git_commit_sample(result.sample_id, result.protocol, cache_path, log_path)
-    
-    def _git_commit_sample(self, sample_id: str, protocol: str, cache_path: Path, log_path: Path):
-        """Git add and commit the sample result files."""
-        try:
-            result = subprocess.run(
-                ['git', 'rev-parse', '--show-toplevel'],
-                cwd=str(self.output_dir),
-                capture_output=True,
-                check=False,
-                timeout=10
-            )
-            if result.returncode != 0:
-                return
-            git_root = result.stdout.decode().strip()
-            
-            subprocess.run(
-                ['git', 'add', str(cache_path), str(log_path)],
-                cwd=str(git_root),
-                capture_output=True,
-                check=False,
-                timeout=30
-            )
-            
-            safe_id = sample_id.replace('/', '_')[:50]
-            commit_msg = f"Add result for {protocol}:{safe_id}"
-            
-            subprocess.run(
-                ['git', 'commit', '-m', commit_msg, '--no-verify'],
-                cwd=str(git_root),
-                capture_output=True,
-                check=False,
-                timeout=30
-            )
-        except subprocess.TimeoutExpired:
-            pass
-        except Exception:
-            pass
     
     def evaluate(self) -> Dict[str, Any]:
         """Run evaluation across all protocols and samples."""
@@ -1149,6 +1549,10 @@ class Evaluator:
                 logger.info(f"Cache stats for {protocol}: {cached_count} cached, {evaluated_count} evaluated")
         
         self._total_runtime = time.time() - self._start_time
+        
+        # Regenerate LaTeX config file to include all evaluated queries
+        self._save_config_latex()
+        
         return self._aggregate_all_results()
     
     def _evaluate_sample(self, sample: FinanceBenchSample, protocol: str) -> EvaluationResult:
@@ -1314,6 +1718,34 @@ class Evaluator:
         """Print summary table to console."""
         summary = self._aggregate_all_results()
         
+        # Print per-query details first
+        print("\n" + "="*80)
+        print("PER-QUERY DETAILS")
+        print("="*80)
+        
+        for protocol in self.protocols:
+            results = self.results.get(protocol, [])
+            if not results:
+                continue
+            
+            print(f"\n{protocol.upper()}:")
+            print("-"*80)
+            if self.skip_accuracy:
+                print(f"{'Sample ID':<45} {'Cost ($)':<12} {'Input Tok':<12} {'Output Tok':<12}")
+            else:
+                print(f"{'Sample ID':<40} {'Correct':<10} {'Cost ($)':<12} {'Input Tok':<12} {'Output Tok':<12}")
+            print("-"*80)
+            
+            for r in results:
+                sample_id = r.sample_id[:42] + "..." if len(r.sample_id) > 45 else r.sample_id
+                if self.skip_accuracy:
+                    print(f"{sample_id:<45} {r.cost_usd:<12.4f} {r.input_tokens:<12} {r.output_tokens:<12}")
+                else:
+                    correct_str = "✓" if r.is_correct else ("✗" if r.is_correct is False else "?")
+                    sample_id = r.sample_id[:37] + "..." if len(r.sample_id) > 40 else r.sample_id
+                    print(f"{sample_id:<40} {correct_str:<10} {r.cost_usd:<12.4f} {r.input_tokens:<12} {r.output_tokens:<12}")
+        
+        # Print aggregate summary
         print("\n" + "="*80)
         print("EVALUATION SUMMARY")
         print("="*80)
@@ -1399,7 +1831,6 @@ class Evaluator:
         lines.append(f"    output_dir: {global_config.get('output_dir', 'evaluate/results')}")
         lines.append(f"    skip_accuracy: {str(global_config.get('skip_accuracy', False)).lower()}")
         lines.append(f"    use_cache: {str(global_config.get('use_cache', True)).lower()}")
-        lines.append(f"    git_auto_commit: {str(global_config.get('git_auto_commit', True)).lower()}")
         
         return "\n".join(lines)
     
@@ -1424,6 +1855,36 @@ class Evaluator:
                     f.write(f"Total runtime: {seconds:.1f}s\n")
                 f.write("\n")
             
+            # Write per-query details
+            f.write("="*80 + "\n")
+            f.write("PER-QUERY DETAILS\n")
+            f.write("="*80 + "\n")
+            
+            for protocol in self.protocols:
+                results = self.results.get(protocol, [])
+                if not results:
+                    continue
+                
+                f.write(f"\n{protocol.upper()}:\n")
+                f.write("-"*80 + "\n")
+                if self.skip_accuracy:
+                    f.write(f"{'Sample ID':<45} {'Cost ($)':<12} {'Input Tok':<12} {'Output Tok':<12}\n")
+                else:
+                    f.write(f"{'Sample ID':<40} {'Correct':<10} {'Cost ($)':<12} {'Input Tok':<12} {'Output Tok':<12}\n")
+                f.write("-"*80 + "\n")
+                
+                for r in results:
+                    sample_id = r.sample_id[:42] + "..." if len(r.sample_id) > 45 else r.sample_id
+                    if self.skip_accuracy:
+                        f.write(f"{sample_id:<45} {r.cost_usd:<12.4f} {r.input_tokens:<12} {r.output_tokens:<12}\n")
+                    else:
+                        correct_str = "Y" if r.is_correct else ("N" if r.is_correct is False else "?")
+                        sample_id = r.sample_id[:37] + "..." if len(r.sample_id) > 40 else r.sample_id
+                        f.write(f"{sample_id:<40} {correct_str:<10} {r.cost_usd:<12.4f} {r.input_tokens:<12} {r.output_tokens:<12}\n")
+            
+            f.write("\n")
+            
+            # Write aggregate summary
             f.write("="*80 + "\n")
             f.write("EVALUATION SUMMARY\n")
             f.write("="*80 + "\n")
@@ -1452,15 +1913,24 @@ class Evaluator:
 
 def main():
     """Main entry point using Kconfig .config file."""
-    if len(sys.argv) != 2:
-        print("Usage: python financebench_evaluator.py <.config>")
-        print("\nExample:")
-        print("  python evaluate/financebench_evaluator.py .config")
-        print("\nTo create a configuration interactively:")
-        print("  python evaluate/kmenuconfig.py")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(
+        description="FinanceBench Evaluator - Evaluate protocols on FinanceBench dataset",
+        epilog="To create a configuration interactively: python evaluate/kmenuconfig.py"
+    )
+    parser.add_argument(
+        "config",
+        help="Path to .config file (created by kmenuconfig.py)"
+    )
+    parser.add_argument(
+        "--logit-processor-path",
+        type=str,
+        default=None,
+        help="Path to learned logit processor file (.py). Overrides LOGIT_PROCESSOR_PATH in config. "
+             "If not specified and not in config, constraint decoding is disabled."
+    )
     
-    config_path = sys.argv[1]
+    args = parser.parse_args()
+    config_path = args.config
     
     try:
         config = load_config(config_path)
@@ -1468,6 +1938,22 @@ def main():
     except Exception as e:
         logger.error(f"Failed to load configuration: {e}")
         sys.exit(1)
+    
+    # Determine logit processor path: CLI flag > Kconfig > None
+    logit_processor_path = args.logit_processor_path
+    if logit_processor_path is None:
+        logit_processor_path = getattr(config.models.local, 'logit_processor_path', None)
+    
+    # Load logit processor if path is provided
+    logit_processor = None
+    if logit_processor_path:
+        logit_processor = load_logit_processor(logit_processor_path)
+        if logit_processor is None:
+            logger.warning(f"Constraint decoding disabled - could not load processor from {logit_processor_path}")
+        else:
+            logger.info(f"Constraint decoding enabled with processor from {logit_processor_path}")
+    else:
+        logger.info("Constraint decoding disabled - no logit processor path specified")
     
     # Load dataset (always uses full PDF documents)
     dataset = FinanceBenchDataset(
@@ -1490,7 +1976,19 @@ def main():
         remote_temp=config.models.remote.temperature,
         num_ctx=config.models.local.num_ctx,
         local_backend=getattr(config.models.local, 'backend', 'ollama'),
-        sglang_base_url=getattr(config.models.local, 'sglang_base_url', 'http://localhost:8000/v1')
+        sglang_base_url=getattr(config.models.local, 'sglang_base_url', 'http://localhost:8000/v1'),
+        logit_processor=logit_processor,
+        # WFSA parameters
+        generation_strategy=getattr(config.models.local, 'generation_strategy', 'sequential'),
+        beta_explanation=getattr(config.models.local, 'beta_explanation', 1.0),
+        beta_citation=getattr(config.models.local, 'beta_citation', 2.0),
+        beta_answer=getattr(config.models.local, 'beta_answer', 1.5),
+        min_tokens_explanation=getattr(config.models.local, 'min_tokens_explanation', 10),
+        min_tokens_citation=getattr(config.models.local, 'min_tokens_citation', 5),
+        min_tokens_answer=getattr(config.models.local, 'min_tokens_answer', 3),
+        max_tokens_explanation=getattr(config.models.local, 'max_tokens_explanation', 200),
+        max_tokens_citation=getattr(config.models.local, 'max_tokens_citation', 150),
+        max_tokens_answer=getattr(config.models.local, 'max_tokens_answer', 100),
     )
     
     # Build minions_kwargs from config
@@ -1500,11 +1998,11 @@ def main():
         'num_samples_per_task': config.protocols.common.num_samples_per_task
     })
     
-    # Generate cache directory name if caching is enabled
-    cache_dir_name = None
+    # Get or create cache directory if caching is enabled
+    cache_dir = None
     if config.global_config.use_cache:
-        cache_dir_name = generate_hash_cache_dir_name(config_path)
-        logger.info(f"Cache directory name: {cache_dir_name}")
+        output_dir = Path(config.global_config.output_dir)
+        cache_dir = get_or_create_cache_dir(output_dir, config_path)
     
     config_dict = config.to_dict()
     
@@ -1518,8 +2016,7 @@ def main():
         skip_accuracy=config.global_config.skip_accuracy,
         command_line=f"python {sys.argv[0]} {config_path}",
         use_cache=config.global_config.use_cache,
-        cache_dir_name=cache_dir_name,
-        git_auto_commit=config.global_config.git_auto_commit,
+        cache_dir=cache_dir,
         all_args=config_dict
     )
     
