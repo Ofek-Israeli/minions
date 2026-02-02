@@ -702,7 +702,7 @@ The `apps/` directory contains specialized applications demonstrating various us
 
 ## FinanceBench Evaluator
 
-The `evaluate/` directory contains a benchmarking system for evaluating Minions protocols on the FinanceBench dataset.
+The `evaluate/` directory contains a benchmarking system for evaluating Minions protocols on the FinanceBench dataset. Configuration files are stored in `config/`.
 
 ### Prerequisites
 
@@ -715,8 +715,6 @@ pip install kconfiglib
 ### Quick Start
 
 ```bash
-cd evaluate
-
 # 1. Load default configuration
 make defconfig
 
@@ -730,9 +728,21 @@ make run
 make correctness
 ```
 
+### Directory Structure
+
+```
+config/
+├── Kconfig              # Configuration schema
+├── .config              # Current configuration (generated)
+├── kmenuconfig.py       # Terminal-based config UI
+├── kguiconfig.py        # Graphical config UI
+└── presets/
+    └── defconfig        # Default configuration
+```
+
 ### Configuration
 
-The evaluator uses a Kconfig-based configuration system (similar to the Linux kernel). Configuration is stored in `.config` at the repository root.
+The evaluator uses a Kconfig-based configuration system (similar to the Linux kernel). Configuration is stored in `config/.config`.
 
 **Available Make targets:**
 
@@ -765,8 +775,8 @@ You can also run the evaluator directly without Make:
 
 ```bash
 # Using Python scripts
-python evaluate/kmenuconfig.py              # Interactive config
-python evaluate/financebench_evaluator.py .config  # Run evaluation
+python config/kmenuconfig.py                        # Interactive config
+python evaluate/financebench_evaluator.py config/.config  # Run evaluation
 python evaluate/correctness.py evaluate/results/<run_dir> --verbose
 ```
 
